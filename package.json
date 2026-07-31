@@ -13,6 +13,8 @@
     "build_test": "node tasks/build.js",
     "lint": "npx eslint ./player/js/**/*",
     "lint:fix": "npx eslint ./player/js/**/* --fix",
+    "test:unit": "node --experimental-default-type=module --test test/unit/",
+    "test:unit:coverage": "node --experimental-default-type=module --test --experimental-test-coverage test/unit/",
     "test:create": "node test/index.js",
     "test:compare": "node test/index.js -s compare"
   },

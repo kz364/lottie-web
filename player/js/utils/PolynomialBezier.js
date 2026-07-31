@@ -15,8 +15,11 @@ function lerpPoint(p0, p1, amount) {
 }
 
 function quadRoots(a, b, c) {
-  // no root
-  if (a === 0) return [];
+  // Linear equation, single root unless it is also constant
+  if (a === 0) {
+    if (b === 0) return [];
+    return [-c / b];
+  }
   var s = b * b - 4 * a * c;
   // Complex roots
   if (s < 0) return [];
