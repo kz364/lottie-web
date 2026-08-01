@@ -31,8 +31,10 @@
         var errors = 0;
         window.onerror = function () { errors += 1; };
 
-        // Largest absolute coordinate in the rendered SVG geometry: ~265 when
-        // quadRoots handles the degenerate-linear case, ~2266 when it does not.
+        // Largest absolute coordinate in the rendered SVG path data, in layer
+        // space (the layer is placed by an enclosing translate of 150, 150):
+        // ~115 when quadRoots handles the degenerate-linear case, ~2266 when
+        // it does not.
         function maxAbsCoordinate() {
             var worst = 0;
             var paths = document.querySelectorAll('#svg path');

@@ -29,11 +29,12 @@ python3 -m http.server 8000                  # from the repo root; serves .json 
 ```
 
 The page renders the animation in both the `svg` and `canvas` renderers, and prints the largest absolute
-coordinate found in the rendered SVG geometry:
+coordinate found in the rendered SVG path data. That figure is in layer space: the layer is placed into
+the frame by an enclosing `matrix(1,0,0,1,150,150)`, so add 150 to compare it against the viewport.
 
 | `quadRoots` | max abs SVG coordinate | appearance |
 | --- | --- | --- |
-| fixed (current) | ~265 | bounded closed loop inside the 300x300 frame |
+| fixed (current) | ~115 | bounded closed loop inside the 300x300 frame |
 | degenerate case removed | ~2266 | offset path shoots far outside the frame |
 
 To see the broken state, revert only the `a === 0` branch of `quadRoots` in
