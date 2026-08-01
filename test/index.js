@@ -198,13 +198,20 @@ const startServer = async () => {
     res.status(204).end();
   });
 
+  const rootDirectory = path.resolve('.');
+
   app.get('/*', async (req, res) => {
-    const requestedPath = req.originalUrl.split('?')[0];
-    const isJSON = path.extname(requestedPath) === '.json';
+    const requestedPath = decodeURIComponent(req.originalUrl.split('?')[0]);
+    const filePath = path.resolve(rootDirectory, `.${requestedPath}`);
+    const isJSON = path.extname(filePath) === '.json';
+    if (!filePath.startsWith(`${rootDirectory}${path.sep}`)) {
+      res.status(403).end();
+      return;
+    }
     try {
       // Read before writing the head: a missing file used to throw after the
       // response had started, which crashed the whole process.
-      const data = await readFile(`.${requestedPath}`, isJSON ? 'utf8' : undefined);
+      const data = await readFile(filePath, isJSON ? 'utf8' : undefined);
       res.writeHead(200, getContentTypeHeader(isJSON ? 'json' : 'image'));
       res.end(data);
     } catch (err) {
@@ -319,9 +326,12 @@ const createIndividualAssets = async (page, folderName, settings) => {
   createDirectoryPath(filePath);
   let isLastFrame = false;
   const bridgeHelper = await (createBridgeHelper(page));
+  // Not awaited: the page only settles once it has rendered every frame. A
+  // rejection handler is still needed, since closing a failed page rejects
+  // whatever was in flight.
   page.evaluate(() => {
     window.startProcess();
-  });
+  }).catch(() => {});
   await bridgeHelper.waitForAnimationLoaded();
   while (!isLastFrame) {
     // Disabling rule because execution can't be parallelized
@@ -329,7 +339,7 @@ const createIndividualAssets = async (page, folderName, settings) => {
     await wait(1);
     page.evaluate(() => {
         window.continueExecution();
-    });
+    }).catch(() => {});
     const message = await bridgeHelper.waitForMessage();
     const fileNumber = message.currentFrame.toString().padStart(5, '0');
     const fileName = `image_${fileNumber}.png`;
@@ -416,11 +426,12 @@ const takeImageStrip = async () => {
     const settings = await getSettings();
     browser = await getBrowser();
     await iteratePages(browser, settings);
-    process.exit(0);
   } catch (error) {
     console.log(error); // eslint-disable-line no-console
-    process.exit(1);
+    process.exitCode = 1;
   } finally {
+    // Cleanup has to happen before exiting, or the browser is force-killed and
+    // leaves its profile directory behind.
     if (browser) {
       await browser.close();
     }
