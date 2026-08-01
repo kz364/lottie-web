@@ -1,0 +1,29 @@
+# Unit tests for the pure modules under player/js, run with Node's built-in
+# test runner. Kept separate from testAnimations.yml so a puppeteer/rendering
+# problem cannot mask a unit test failure, and vice versa.
+
+name: Unit tests
+
+on:
+  pull_request
+
+jobs:
+
+  unit_tests:
+
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - uses: actions/setup-node@v4
+      with:
+        # test:unit relies on --experimental-default-type=module (Node >= 20.10)
+        # and --experimental-test-coverage.
+        node-version: '20.18.1'
+    # The unit tests never launch a browser, and puppeteer's postinstall is the
+    # slowest and least reliable part of the install.
+    - run: npm install
+      env:
+        PUPPETEER_SKIP_DOWNLOAD: true
+    - run: npx eslint test/unit/
+    - run: npm run test:unit
+    - run: npm run test:unit:coverage

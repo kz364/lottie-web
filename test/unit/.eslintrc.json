@@ -1,0 +1,12 @@
+{
+    "env": {
+        "browser": false,
+        "node": true
+    },
+    "parserOptions": {
+        "ecmaVersion": 2020
+    },
+    "rules": {
+        "import/extensions": "off"
+    }
+}
