@@ -7,6 +7,7 @@
 const puppeteer = require('puppeteer');
 const express = require('express');
 const fs = require('fs');
+const path = require('path');
 const { promises: { readFile } } = require('fs');
 const commandLineArgs = require('command-line-args');
 const PNG = require('pngjs').PNG;
@@ -15,9 +16,19 @@ const pixelmatch = require('pixelmatch');
 const examplesDirectory = '/test/animations/';
 const createDirectory = 'screenshots/create';
 const compareDirectory = 'screenshots/compare';
+const serverPort = 9999;
 
-function createDirectoryPath(path) {
-    const directories = path.split('/');
+// Every wait in this file is bounded. A renderer that never reaches DOMLoaded,
+// a frame that never reports back or a page that dies must fail the run
+// instead of blocking it forever.
+const timeouts = {
+  animationLoad: 30000,
+  frame: 30000,
+  pageLoad: 30000,
+};
+
+function createDirectoryPath(directoryPath) {
+    const directories = directoryPath.split('/');
     directories.reduce((acc, current) => {
         let dir = acc + '/' + current
         if (!fs.existsSync(dir)) {
@@ -28,10 +39,6 @@ function createDirectoryPath(path) {
 }
 
 const animations = [
-  {
-    fileName: 'pigeon.json',
-    renderer: 'svg',
-  },
   {
     fileName: 'banner.json',
     renderer: 'svg',
@@ -100,6 +107,12 @@ const getSettings = async () => {
             return val === 'compare' ? 'compare' : 'create';
           },
           description: 'Whether it is the create or the compare step',
+        },
+        {
+          name: 'animation',
+          alias: 'a',
+          type: String,
+          description: 'Only process animations whose file name contains this value',
         }
     ];
   const settings = {
@@ -110,6 +123,31 @@ const getSettings = async () => {
 };
 
 const wait = (time) => new Promise((resolve) => setTimeout(resolve, time));
+
+// Rejects if the wrapped promise has not settled in time, so a stalled page
+// surfaces as a failed animation rather than a hung process.
+const withTimeout = (promise, ms, description) => {
+  let timer;
+  const timeout = new Promise((resolve, reject) => {
+    timer = setTimeout(() => reject(new Error(`Timed out after ${ms}ms waiting for ${description}`)), ms);
+  });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+};
+
+const animationPath = (animation) => (
+  `.${examplesDirectory}${animation.directory ? `${animation.directory}/` : ''}${animation.fileName}`
+);
+
+// The list above is maintained by hand, so a renamed or deleted animation used
+// to show up as a page that never loads. Fail immediately and say which file.
+const validateAnimations = () => {
+  const missing = animations
+    .map(animationPath)
+    .filter((filePath) => !fs.existsSync(filePath));
+  if (missing.length) {
+    throw new Error(`Missing animation files: ${missing.join(', ')}`);
+  }
+};
 
 const filesData = [
   {
@@ -139,6 +177,7 @@ const getContentTypeHeader = (() => {
     json: { 'Content-Type': 'application/json' },
     html: { 'Content-Type': 'text/html; charset=utf-8' },
     wasm: { 'Content-Type': 'application/wasm' },
+    image: { 'Content-Type': 'image/jpeg' },
   };
   return (fileType) => contentTypeMap[fileType];
 })();
@@ -146,7 +185,6 @@ const getContentTypeHeader = (() => {
 const startServer = async () => {
   const app = express();
   await Promise.all(filesData.map(async (file) => {
-    const fileData = await readFile(file.filePath, getEncoding(file.type));
     app.get(file.path, async (req, res) => {
       res.writeHead(200, getContentTypeHeader(file.type));
       // TODO: comment line. Only for live updates.
@@ -156,66 +194,106 @@ const startServer = async () => {
     return file;
   }));
 
+  app.get('/favicon.ico', (req, res) => {
+    res.status(204).end();
+  });
+
   app.get('/*', async (req, res) => {
+    const requestedPath = req.originalUrl.split('?')[0];
+    const isJSON = path.extname(requestedPath) === '.json';
     try {
-      if (req.originalUrl.indexOf('.json') !== -1) {
-        const file = await readFile(`.${req.originalUrl}`, 'utf8');
-        res.send(file);
-      } else {
-        const data = await readFile(`.${req.originalUrl}`);
-        res.writeHead(200, { 'Content-Type': 'image/jpeg' });
-        res.end(data);
-      }
+      // Read before writing the head: a missing file used to throw after the
+      // response had started, which crashed the whole process.
+      const data = await readFile(`.${requestedPath}`, isJSON ? 'utf8' : undefined);
+      res.writeHead(200, getContentTypeHeader(isJSON ? 'json' : 'image'));
+      res.end(data);
     } catch (err) {
-      res.send('');
+      res.status(404).end();
     }
   });
-  app.listen('9999');
+
+  return new Promise((resolve, reject) => {
+    const server = app.listen(serverPort);
+    server.on('listening', () => resolve(server));
+    server.on('error', reject);
+  });
 };
 
-const getBrowser = async () => puppeteer.launch({ defaultViewport: null });
+const getBrowser = async () => puppeteer.launch({
+  defaultViewport: null,
+  headless: 'new',
+  args: [
+    // CI runners have no usable Chromium sandbox.
+    '--no-sandbox',
+    '--disable-setuid-sandbox',
+    // Text is the only thing that rendered differently between two runs of the
+    // same bundle: glyph edges moved by a fraction of a pixel. Hinting and
+    // subpixel positioning are what make that vary.
+    '--font-render-hinting=none',
+    '--disable-font-subpixel-positioning',
+    '--disable-lcd-text',
+    '--force-device-scale-factor=1',
+    '--hide-scrollbars',
+  ],
+});
 
-const startPage = async (browser, path, renderer) => {
-  const targetURL = `http://localhost:9999/test/index.html\
-?path=${encodeURIComponent(path)}&renderer=${renderer}`;
+const startPage = async (browser, animationURL, renderer) => {
+  const targetURL = `http://localhost:${serverPort}/test/index.html\
+?path=${encodeURIComponent(animationURL)}&renderer=${renderer}`;
   const page = await browser.newPage();
   page.on('console', (msg) => console.log('PAGE LOG:', msg.text())); // eslint-disable-line no-console
   await page.setViewport({
     width: 1024,
     height: 768,
   });
-  await page.goto(targetURL);
+  await page.goto(targetURL, { timeout: timeouts.pageLoad });
   return page;
 };
 
-const createBridgeHelper = async (page) => {
-  let resolveScoped;
-  let animationLoadedPromise;
-  const messageHandler = (event) => {
-    resolveScoped(event);
-  };
-  const onAnimationLoaded = () => {
-    if (animationLoadedPromise) {
-        animationLoadedPromise()
+// Events emitted by the page are queued, so an event that arrives before its
+// waiter is registered is still delivered instead of being dropped.
+const createEventLatch = () => {
+  const pending = [];
+  let waiter = null;
+  const push = (value) => {
+    if (waiter) {
+      const resolve = waiter;
+      waiter = null;
+      resolve(value);
+    } else {
+      pending.push(value);
     }
-  }
-  await page.exposeFunction('onAnimationLoaded', onAnimationLoaded);
-  await page.exposeFunction('onMessageReceivedEvent', messageHandler);
-  const waitForMessage = () => new Promise((resolve) => {
-    resolveScoped = resolve;
-  });
-  const waitForAnimationLoaded = () => new Promise((resolve) => {
-    animationLoadedPromise = resolve;
-  });
-  const continueExecution = async () => {
-    page.evaluate(() => {
-      window.continueExecution();
-    });
   };
+  const next = () => (
+    pending.length
+      ? Promise.resolve(pending.shift())
+      : new Promise((resolve) => { waiter = resolve; })
+  );
+  return { push, next };
+};
+
+const createBridgeHelper = async (page) => {
+  const loaded = createEventLatch();
+  const messages = createEventLatch();
+  const failures = createEventLatch();
+  await page.exposeFunction('onAnimationLoaded', () => loaded.push(true));
+  await page.exposeFunction('onMessageReceivedEvent', (event) => messages.push(event));
+  await page.exposeFunction('onAnimationFailed', (reason) => failures.push(new Error(reason)));
+  // A crashed page or a failed animation load must lose the race against the
+  // event it would otherwise make us wait for indefinitely.
+  const rejectOnFailure = new Promise((resolve, reject) => {
+    failures.next().then(reject);
+    page.on('pageerror', (error) => reject(error));
+  });
+  // Nothing is waiting on it until the first race, and an unhandled rejection
+  // would take the process down.
+  rejectOnFailure.catch(() => {});
+  const race = (promise, timeout, description) => (
+    withTimeout(Promise.race([promise, rejectOnFailure]), timeout, description)
+  );
   return {
-    waitForAnimationLoaded,
-    waitForMessage,
-    continueExecution,
+    waitForAnimationLoaded: () => race(loaded.next(), timeouts.animationLoad, 'the animation to load'),
+    waitForMessage: () => race(messages.next(), timeouts.frame, 'a frame to be rendered'),
   };
 };
 
@@ -272,18 +350,6 @@ const createIndividualAssets = async (page, folderName, settings) => {
   }
 };
 
-const getDirFiles = async (directory) => (
-  new Promise((resolve, reject) => {
-    fs.readdir(directory, (err, files) => {
-      if (err) {
-        reject(err);
-      } else {
-        resolve(files);
-      }
-    });
-  })
-);
-
 async function processPage(browser, settings, directory, animation) {
   let fullDirectory = `${directory}`;
   if (animation.directory) {
@@ -296,13 +362,20 @@ async function processPage(browser, settings, directory, animation) {
   if (animation.directory) {
     fullName = `${animation.directory}_` + fullName;
   }
-  await createIndividualAssets(page, fullName, settings);
+  try {
+    await createIndividualAssets(page, fullName, settings);
+  } finally {
+    await page.close();
+  }
 }
 
 const iteratePages = async (browser, settings) => {
   const failedAnimations = [];
-  for (let i = 0; i < animations.length; i += 1) {
-    const animation = animations[i];
+  const selected = settings.animation
+    ? animations.filter((animation) => animation.fileName.indexOf(settings.animation) !== -1)
+    : animations;
+  for (let i = 0; i < selected.length; i += 1) {
+    const animation = selected[i];
     let fileName =  `${animation.renderer}_${animation.fileName}`;
     if (animation.directory) {
       fileName = `${animation.directory}_` + fileName;
@@ -317,11 +390,12 @@ const iteratePages = async (browser, settings) => {
             console.log(`Animation passed: ${fileName}`);
         }
     } catch (error) {
-        if (settings.step === 'compare') {
-            failedAnimations.push({
-              fileName: fileName
-            })
-        }
+        // Both steps report failures. The create step used to swallow them and
+        // exit successfully having written no screenshots at all.
+        console.log(`Animation errored: ${fileName}`, error.message);
+        failedAnimations.push({
+          fileName: fileName
+        })
     }
   }
   if (failedAnimations.length) {
@@ -334,16 +408,25 @@ const iteratePages = async (browser, settings) => {
 
 
 const takeImageStrip = async () => {
+  let server;
+  let browser;
   try {
-    await startServer();
+    validateAnimations();
+    server = await startServer();
     const settings = await getSettings();
-    await wait(1);
-    const browser = await getBrowser();
+    browser = await getBrowser();
     await iteratePages(browser, settings);
     process.exit(0);
   } catch (error) {
     console.log(error); // eslint-disable-line no-console
     process.exit(1);
+  } finally {
+    if (browser) {
+      await browser.close();
+    }
+    if (server) {
+      server.close();
+    }
   }
 };
 
