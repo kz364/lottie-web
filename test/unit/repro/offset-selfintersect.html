@@ -1,0 +1,62 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <title>Offset path self-intersection repro</title>
+    <style>
+        body { font-family: monospace; margin: 16px; }
+        .panels { display: flex; gap: 16px; }
+        .panel { border: 1px solid #ccc; }
+        .panel div { width: 300px; height: 300px; overflow: hidden; }
+        .panel p { margin: 0; padding: 4px 8px; background: #eee; }
+        #readout { margin-top: 12px; }
+    </style>
+</head>
+<body>
+    <h1>OffsetPathModifier / quadRoots repro</h1>
+    <p>
+        Renders <code>test/animations/offset-selfintersect.json</code>, whose path has handles that make the
+        cubic coefficient of both axes exactly zero. With the <code>quadRoots</code> degenerate-linear case
+        missing, <code>boundingBox()</code> collapses, <code>intersections()</code> misses the offset path's
+        self-crossings, and the blue offset path shoots far outside the 300x300 viewport.
+    </p>
+    <div class="panels">
+        <div class="panel"><p>svg</p><div id="svg"></div></div>
+        <div class="panel"><p>canvas</p><div id="canvas"></div></div>
+    </div>
+    <pre id="readout">loading...</pre>
+
+    <script src="../../../build/player/lottie.js"></script>
+    <script>
+        var errors = 0;
+        window.onerror = function () { errors += 1; };
+
+        // Largest absolute coordinate in the rendered SVG geometry: ~265 when
+        // quadRoots handles the degenerate-linear case, ~2266 when it does not.
+        function maxAbsCoordinate() {
+            var worst = 0;
+            var paths = document.querySelectorAll('#svg path');
+            for (var i = 0; i < paths.length; i += 1) {
+                var numbers = (paths[i].getAttribute('d') || '').match(/-?\d+(\.\d+)?/g) || [];
+                for (var j = 0; j < numbers.length; j += 1) {
+                    worst = Math.max(worst, Math.abs(parseFloat(numbers[j])));
+                }
+            }
+            return worst;
+        }
+
+        ['svg', 'canvas'].forEach(function (renderer) {
+            lottie.loadAnimation({
+                container: document.getElementById(renderer),
+                path: '../../animations/offset-selfintersect.json',
+                renderer: renderer,
+                loop: false,
+                autoplay: false,
+            }).addEventListener('DOMLoaded', function () {
+                document.getElementById('readout').textContent = 'max abs svg coordinate: '
+                    + maxAbsCoordinate().toFixed(1) + '\njs errors: ' + errors;
+            });
+        });
+    </script>
+</body>
+</html>

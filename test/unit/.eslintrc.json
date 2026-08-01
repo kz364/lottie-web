@@ -7,7 +7,6 @@
         "ecmaVersion": 2020
     },
     "rules": {
-        "import/extensions": "off",
-        "import/no-unresolved": "off"
+        "import/extensions": "off"
     }
 }

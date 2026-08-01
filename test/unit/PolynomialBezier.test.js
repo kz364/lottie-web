@@ -9,6 +9,22 @@ import {
   floatEqual,
 } from '../../player/js/utils/PolynomialBezier.js';
 
+// Angles produced by this module are consumed by polarOffset, which treats y as
+// growing downwards; these helpers keep the tests in that same frame.
+function offsetDirection(bez, t, angle) {
+  var origin = bez.point(t);
+  var moved = polarOffset(origin, angle, 1);
+  return [moved[0] - origin[0], moved[1] - origin[1]];
+}
+
+function dot(u, v) {
+  return u[0] * v[0] + u[1] * v[1];
+}
+
+function cross(u, v) {
+  return u[0] * v[1] - u[1] * v[0];
+}
+
 // Ground truth: cubic bezier in Bernstein form, independent of the polynomial
 // coefficient form the module under test uses.
 function bernstein(p0, p1, p2, p3, t) {
@@ -69,18 +85,55 @@ test('derivative() matches a numerical derivative of point()', function () {
   });
 });
 
-test('tangentAngle() and normalAngle() describe perpendicular directions', function () {
-  // Straight diagonal: the tangent is constant at 45 degrees.
-  var bez = new PolynomialBezier([0, 0], [10, 10], [20, 20], [30, 30], false);
+test('tangentAngle() follows the direction the curve is travelling in', function () {
+  var bez = new PolynomialBezier([0, 0], [30, 90], [70, -40], [100, 50], false);
+  var h = 1e-6;
 
-  assert.ok(Math.abs(bez.tangentAngle(0.5) - Math.PI / 4) < 1e-9);
-  // normalAngle mirrors the tangent across the 45 degree line, so the two
-  // directions are always a quarter turn apart.
-  var difference = Math.abs(bez.tangentAngle(0.5) - bez.normalAngle(0.5));
-  assert.ok(Math.abs(difference - Math.PI / 2) < 1e-9 || Math.abs(difference) < 1e-9);
+  [0.1, 0.4, 0.75].forEach(function (t) {
+    var before = bez.point(t - h);
+    var after = bez.point(t + h);
+    var travel = Math.atan2(after[1] - before[1], after[0] - before[0]);
+    assert.ok(Math.abs(bez.tangentAngle(t) - travel) < 1e-4, bez.tangentAngle(t) + ' vs ' + travel);
+  });
 
-  var curve = new PolynomialBezier([0, 0], [0, 20], [20, 20], [20, 0], false);
-  assert.ok(Math.abs(curve.normalAngle(0.5) - Math.atan2(curve.derivative(0.5)[0], curve.derivative(0.5)[1])) < 1e-12);
+  // Straight diagonal: the direction of travel does not depend on t.
+  var diagonal = new PolynomialBezier([0, 0], [10, 10], [20, 20], [30, 30], false);
+  SAMPLES.forEach(function (t) {
+    assert.ok(Math.abs(diagonal.tangentAngle(t) - Math.PI / 4) < 1e-9);
+  });
+});
+
+test('normalAngle() is the polarOffset angle that steps sideways off the curve', function () {
+  // The convention is set by the callers, not by textbook geometry:
+  // OffsetPathModifier's linearOffset() computes atan2(dx, dy) and hands it
+  // straight to polarOffset(), and its round join builds the same direction as
+  // -tangentAngle() + PI / 2. So normalAngle is deliberately NOT
+  // tangentAngle +/- PI / 2; it is the tangent mirrored across the 45 degree
+  // line, which is what polarOffset's downward y needs to yield a perpendicular
+  // step. The assertions below are on that step, not on the raw angle.
+  var bez = new PolynomialBezier([0, 0], [30, 90], [70, -40], [100, 50], false);
+
+  [0.2, 0.5, 0.8].forEach(function (t) {
+    var tangent = bez.derivative(t);
+    var step = offsetDirection(bez, t, bez.normalAngle(t));
+
+    assert.ok(Math.abs(dot(tangent, step)) < 1e-9, 'not perpendicular: ' + dot(tangent, step));
+    assert.ok(Math.abs(pointDistance([0, 0], step) - 1) < 1e-12);
+    // Always the same side of the curve, otherwise an offset path built from
+    // these angles would flip across itself part way along.
+    assert.ok(cross(tangent, step) < 0, 'side flipped: ' + cross(tangent, step));
+
+    // Mirror identity, and agreement with the round-join construction.
+    assert.ok(Math.abs(bez.normalAngle(t) - (Math.PI / 2 - bez.tangentAngle(t))) < 1e-12);
+    assertPointClose(offsetDirection(bez, t, -bez.tangentAngle(t) + Math.PI / 2), step, 1e-12);
+    // The quarter turn a naive reading would expect is wrong here.
+    assert.ok(Math.abs(Math.abs(bez.normalAngle(t) - bez.tangentAngle(t)) - Math.PI / 2) > 1e-6);
+  });
+
+  // Straight segment: the same angle linearOffset() would compute for it.
+  var horizontal = new PolynomialBezier([0, 0], [10, 0], [20, 0], [30, 0], false);
+  assert.equal(horizontal.normalAngle(0.5), Math.atan2(30, 0));
+  assertPointClose(polarOffset([0, 0], horizontal.normalAngle(0.5), 5), [0, -5], 1e-12);
 });
 
 test('linearize repositions coincident control points so the curve keeps a tangent', function () {
@@ -187,11 +240,30 @@ test('inflectionPoints() returns nothing for curves that never change curvature'
   assert.deepEqual(new PolynomialBezier([0, 0], [10, 10], [20, 20], [30, 30], false).inflectionPoints(), []);
   // Single arc bending one way only: the discriminant is negative.
   assert.deepEqual(new PolynomialBezier([0, 0], [0, 100], [100, 100], [100, 0], false).inflectionPoints(), []);
-  // Inflections outside the [0, 1] domain are discarded.
-  var offDomain = new PolynomialBezier([0, 0], [40, 60], [80, 90], [100, 100], false);
-  offDomain.inflectionPoints().forEach(function (t) {
-    assert.ok(t > 0 && t < 1);
-  });
+});
+
+test('inflectionPoints() discards roots that fall outside the drawn segment', function () {
+  // Both roots of this curve's inflection quadratic are real, but only one of
+  // them lies on [0, 1]. Evaluating the polynomial before t = 0 shows the other
+  // inflection genuinely exists near t = -0.74, so a single returned value is
+  // evidence that the domain filter dropped it -- not that the curve only ever
+  // had one.
+  var bez = new PolynomialBezier([0, 0], [100, 20], [60, 40], [100, 100], false);
+
+  var inflections = bez.inflectionPoints();
+  assert.equal(inflections.length, 1);
+  assert.ok(inflections[0] > 0 && inflections[0] < 1);
+  assert.ok(signedCurvature(bez, inflections[0] - 0.05) * signedCurvature(bez, inflections[0] + 0.05) < 0);
+
+  // Exactly one curvature sign change on the segment itself...
+  var inDomainChanges = 0;
+  for (var i = 0; i < 100; i += 1) {
+    if (signedCurvature(bez, i / 100) * signedCurvature(bez, (i + 1) / 100) < 0) inDomainChanges += 1;
+  }
+  assert.equal(inDomainChanges, 1);
+  // ...and a second one before it starts, which must not be reported.
+  assert.ok(signedCurvature(bez, -0.9) * signedCurvature(bez, -0.6) < 0);
+  assert.ok(inflections.every(function (t) { return t > 0; }));
 });
 
 test('intersections() reports parameter pairs that meet on both curves', function () {
@@ -238,20 +310,38 @@ test('intersections() finds crossings of a curve whose handles are symmetric', f
   assert.ok(ascending > 0 && descending > 0);
 });
 
-test('intersections() tightens with a smaller tolerance and stops at maxRecursion', function () {
+test('intersections() converges as tolerance shrinks, and maxRecursion caps the search', function () {
   var first = new PolynomialBezier([0, 0], [40, 120], [60, -20], [100, 100], false);
   var second = new PolynomialBezier([0, 100], [40, -20], [60, 120], [100, 0], false);
 
-  var coarse = first.intersections(second, 20, 7);
+  // The observable quality of an answer: how far apart the two points that are
+  // claimed to coincide actually are.
+  function worstGap(pairs) {
+    return pairs.reduce(function (worst, pair) {
+      return Math.max(worst, pointDistance(first.point(pair[0]), second.point(pair[1])));
+    }, 0);
+  }
+
+  // Recursion deep enough that tolerance, not depth, is the binding constraint.
+  var coarse = first.intersections(second, 20, 12);
+  var medium = first.intersections(second, 2, 12);
   var fine = first.intersections(second, 0.05, 12);
 
-  assert.ok(coarse.length > 0 && fine.length > 0);
-  fine.forEach(function (pair) {
-    assertPointClose(first.point(pair[0]), second.point(pair[1]), 0.1);
-  });
-  // A shallow recursion limit cannot refine below the box size it stopped at.
-  var shallow = first.intersections(second, 0.05, 1);
-  assert.ok(shallow.length > 0);
+  assert.equal(coarse.length, 2);
+  assert.equal(medium.length, 2);
+  assert.equal(fine.length, 2);
+  assert.ok(worstGap(coarse) > worstGap(medium), 'coarse ' + worstGap(coarse) + ' vs medium ' + worstGap(medium));
+  assert.ok(worstGap(medium) > worstGap(fine), 'medium ' + worstGap(medium) + ' vs fine ' + worstGap(fine));
+  assert.ok(worstGap(coarse) > 1, 'coarse gap was ' + worstGap(coarse));
+  assert.ok(worstGap(fine) < 0.05, 'fine gap was ' + worstGap(fine));
+
+  // maxRecursion is a hard stop on subdivision: with a tolerance it can never
+  // reach, the reported parameters are exactly the midpoints of the boxes still
+  // alive at that depth -- halves at depth 1, quarters at depth 2. Error is not
+  // monotonic in depth (a deeper search keeps a different set of candidate
+  // boxes), so only this structural claim is asserted.
+  assert.deepEqual(first.intersections(second, 0.05, 1), [[0.25, 0.25], [0.75, 0.75]]);
+  assert.deepEqual(first.intersections(second, 0.05, 2), [[0.375, 0.375], [0.625, 0.625]]);
 });
 
 test('shapeSegment() and shapeSegmentInverted() wrap around the closing segment', function () {
